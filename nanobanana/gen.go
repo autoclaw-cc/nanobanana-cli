@@ -34,12 +34,21 @@ type Result struct {
 type Options struct {
 	Prompt     string
 	OutDir     string
-	ThumbWidth int           // target thumbnail width in px (height preserves aspect)
-	Timeout    time.Duration // max time to wait for image to appear
+	ThumbWidth int
+	Timeout    time.Duration
 }
 
-// Gen orchestrates: navigate → fill prompt → submit → wait for image →
-// canvas-extract displayed PNG → save full + locally-generated thumbnail.
+// Gen orchestrates:
+//
+//	navigate → fill prompt → submit → wait for inline image →
+//	install fetch-hook that breaks Gemini's download chain at step 3 →
+//	click "Download full-size" (hook captures final URL, prevents Chrome's
+//	download manager from firing — no native save dialog) →
+//	fetch the real PNG from evaluate() → save full + thumbnail.
+//
+// The inline <img> in the chat is a 1024×559 display thumbnail; the real
+// original (e.g. 2816×1536) is only served through Gemini's 4-hop download
+// chain and is never rendered in the DOM.
 func Gen(c *browser.Client, opts Options) (*Result, error) {
 	start := time.Now()
 	if opts.Prompt == "" {
@@ -52,48 +61,53 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 		opts.ThumbWidth = 256
 	}
 	if opts.Timeout <= 0 {
-		opts.Timeout = 90 * time.Second
+		opts.Timeout = 300 * time.Second
 	}
 	if err := os.MkdirAll(opts.OutDir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir output dir: %w", err)
 	}
 
-	// 1. Open Gemini in a new tab.
 	if err := c.Navigate(geminiURL, true); err != nil {
 		return nil, fmt.Errorf("navigate: %w", err)
 	}
-
-	// 2. Wait for prompt textbox to appear (SPA may take a beat to hydrate).
 	if err := waitTextbox(c, 15*time.Second); err != nil {
 		return nil, err
 	}
-
-	// 3. Inject prompt via execCommand("insertText") to trigger input events
-	//    (Gemini uses a Quill editor; plain value setting won't enable the send
-	//    button, since Angular only reacts to real input events).
 	if err := injectPrompt(c, opts.Prompt); err != nil {
 		return nil, err
 	}
-
-	// 4. Click send button (class `send-button` is stable; aria-label is locale-dep).
 	if err := clickSend(c); err != nil {
 		return nil, err
 	}
-
-	// 5. Poll until <generated-image> has a fully loaded <img>, then canvas-
-	//    extract base64 PNG. fetch()-ing the underlying URL won't work: Gemini
-	//    revokes the blob and the signed `lh3.googleusercontent.com/gg-dl/*`
-	//    URLs are single-use nonces.
-	dataURL, w, h, err := waitAndExtractImage(c, opts.Timeout)
-	if err != nil {
+	if err := waitForDisplayedImage(c, opts.Timeout); err != nil {
 		return nil, err
 	}
 
-	// 6. Decode PNG, write full, resize to thumb, write thumb.
-	pngBytes, err := decodeDataURL(dataURL)
-	if err != nil {
-		return nil, fmt.Errorf("decode dataURL: %w", err)
+	// Install the fetch-hook that breaks Gemini's download chain. The chain is:
+	//   POST c8o8Fe                                → JSON, body contains gg-dl URL
+	//   GET  lh3.../gg-dl/...?alr=yes              → text/plain = fife URL
+	//   GET  work.fife.usercontent.google.com/...  → text/plain = final lh3 URL  ← INTERCEPTED
+	//   (Chrome would navigate to the final URL and save via its download
+	//    manager, popping up a save-as dialog — we prevent that by returning
+	//    an empty response for step 3, then fetching step 4 ourselves via
+	//    fetch(), which stays in the JS realm with no download manager.)
+	if err := installDownloadHook(c); err != nil {
+		return nil, err
 	}
+
+	if err := clickDownload(c); err != nil {
+		return nil, err
+	}
+
+	pngBytes, err := fetchInterceptedImage(c, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	w, h, err := pngDimensions(pngBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse downloaded PNG: %w", err)
+	}
+
 	stem := time.Now().Format("20060102-150405")
 	fullPath := filepath.Join(opts.OutDir, stem+"-full.png")
 	thumbPath := filepath.Join(opts.OutDir, stem+"-thumb.png")
@@ -118,7 +132,7 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 	}, nil
 }
 
-// --- browser-side steps ---
+// --- browser-side helpers ---
 
 func waitTextbox(c *browser.Client, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
@@ -127,7 +141,9 @@ func waitTextbox(c *browser.Client, timeout time.Duration) error {
 		return { ok: !!tb };
 	})()`
 	for time.Now().Before(deadline) {
-		var out struct{ OK bool `json:"ok"` }
+		var out struct {
+			OK bool `json:"ok"`
+		}
 		if err := c.EvaluateValue(code, &out); err == nil && out.OK {
 			return nil
 		}
@@ -144,12 +160,11 @@ func injectPrompt(c *browser.Client, prompt string) error {
 		tb.focus();
 		document.execCommand('selectAll', false, null);
 		document.execCommand('insertText', false, %s);
-		return { ok: true, text: (tb.innerText||'').slice(0, 200) };
+		return { ok: true };
 	})()`, string(encoded))
 	var out struct {
-		OK   bool   `json:"ok"`
-		Err  string `json:"err"`
-		Text string `json:"text"`
+		OK  bool   `json:"ok"`
+		Err string `json:"err"`
 	}
 	if err := c.EvaluateValue(code, &out); err != nil {
 		return fmt.Errorf("inject prompt: %w", err)
@@ -162,20 +177,15 @@ func injectPrompt(c *browser.Client, prompt string) error {
 
 func clickSend(c *browser.Client) error {
 	const code = `(function(){
-		const selectors = [
-			'button.send-button',
-			'button[aria-label="发送"]',
-			'button[aria-label="Send"]'
-		];
+		const selectors = ['button.send-button','button[aria-label="发送"]','button[aria-label="Send"]'];
 		for (const sel of selectors) {
 			const b = document.querySelector(sel);
-			if (b && !b.disabled) { b.click(); return { ok: true, sel }; }
+			if (b && !b.disabled) { b.click(); return { ok: true }; }
 		}
 		return { ok: false, err: 'send_button_not_found' };
 	})()`
 	var out struct {
 		OK  bool   `json:"ok"`
-		Sel string `json:"sel"`
 		Err string `json:"err"`
 	}
 	if err := c.EvaluateValue(code, &out); err != nil {
@@ -187,70 +197,163 @@ func clickSend(c *browser.Client) error {
 	return nil
 }
 
-func waitAndExtractImage(c *browser.Client, timeout time.Duration) (string, int, int, error) {
-	const pollCode = `(function(){
-		const img = document.querySelector(
-			'generated-image img, .generated-image img, single-image img'
-		);
-		if (!img) return { state: 'pending' };
-		if (!img.complete || img.naturalWidth === 0) return { state: 'loading' };
-		return { state: 'ready', w: img.naturalWidth, h: img.naturalHeight };
+func waitForDisplayedImage(c *browser.Client, timeout time.Duration) error {
+	const code = `(function(){
+		const img = document.querySelector('generated-image img, .generated-image img, single-image img');
+		if (!img || !img.complete || img.naturalWidth === 0) return { ready: false };
+		return { ready: true };
 	})()`
-	const extractCode = `(function(){
-		const img = document.querySelector(
-			'generated-image img, .generated-image img, single-image img'
-		);
-		if (!img) return { ok: false, err: 'no_image' };
-		if (!img.complete || img.naturalWidth === 0) return { ok: false, err: 'not_loaded' };
-		const c = document.createElement('canvas');
-		c.width = img.naturalWidth;
-		c.height = img.naturalHeight;
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var out struct {
+			Ready bool `json:"ready"`
+		}
+		if err := c.EvaluateValue(code, &out); err != nil {
+			return fmt.Errorf("poll image: %w", err)
+		}
+		if out.Ready {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for generated image (did Gemini route this prompt to image generation?)")
+}
+
+func clickDownload(c *browser.Client) error {
+	const code = `(function(){
+		const b = document.querySelector('[data-test-id="download-generated-image-button"]');
+		if (!b) return { ok: false, err: 'download_button_not_found' };
+		b.click();
+		return { ok: true };
+	})()`
+	var out struct {
+		OK  bool   `json:"ok"`
+		Err string `json:"err"`
+	}
+	if err := c.EvaluateValue(code, &out); err != nil {
+		return fmt.Errorf("click download: %w", err)
+	}
+	if !out.OK {
+		return fmt.Errorf("click download failed: %s", out.Err)
+	}
+	return nil
+}
+
+// installDownloadHook wraps window.fetch so the step-3 response (which
+// contains the final image URL as plain text) is captured into
+// window.__nbFinalURL and then replaced with an empty 200 response. This
+// breaks the chain client-side — Gemini's next step becomes a no-op and
+// Chrome never sees a navigation to a Content-Disposition response, so no
+// save dialog fires.
+func installDownloadHook(c *browser.Client) error {
+	const code = `(function(){
+		if (window.__nbHookV3) return { ok: true, already: true };
+		window.__nbHookV3 = true;
+		window.__nbFinalURL = null;
+		window.__nbFinalURLAt = 0;
+		if (!window.__nbOrigFetch) window.__nbOrigFetch = window.fetch;
+		const origFetch = window.__nbOrigFetch;
+		window.fetch = async function(input, init){
+			const url = typeof input === 'string' ? input : (input && input.url) || '';
+			if (url.includes('work.fife.usercontent.google.com/rd-gg-dl/')) {
+				const resp = await origFetch.apply(this, arguments);
+				try {
+					const text = await resp.clone().text();
+					window.__nbFinalURL = (text || '').trim();
+					window.__nbFinalURLAt = Date.now();
+				} catch (e) { /* ignore */ }
+				return new Response('', { status: 200, statusText: 'OK',
+					headers: { 'content-type': 'text/plain' } });
+			}
+			return origFetch.apply(this, arguments);
+		};
+		return { ok: true };
+	})()`
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.EvaluateValue(code, &out); err != nil {
+		return fmt.Errorf("install download hook: %w", err)
+	}
+	if !out.OK {
+		return fmt.Errorf("install download hook: unknown failure")
+	}
+	return nil
+}
+
+// fetchInterceptedImage polls for window.__nbFinalURL (set by the step-3
+// hook), then fetches the real PNG bytes via evaluate() and returns them.
+// The fetch stays in the JS realm, so Chrome's download manager is never
+// invoked and no save-as dialog appears.
+func fetchInterceptedImage(c *browser.Client, timeout time.Duration) ([]byte, error) {
+	const pollCode = `(function(){ return { url: window.__nbFinalURL || '', at: window.__nbFinalURLAt || 0 }; })()`
+	const fetchCode = `(async function(){
+		const u = window.__nbFinalURL;
+		if (!u) return { ok: false, err: 'no_final_url' };
 		try {
-			c.getContext('2d').drawImage(img, 0, 0);
-			return { ok: true, w: img.naturalWidth, h: img.naturalHeight, dataURL: c.toDataURL('image/png') };
-		} catch (e) { return { ok: false, err: 'canvas: ' + String(e).slice(0, 200) }; }
+			const r = await fetch(u);
+			if (!r.ok) return { ok: false, err: 'fetch_failed', status: r.status };
+			const blob = await r.blob();
+			const buf = await blob.arrayBuffer();
+			const u8 = new Uint8Array(buf);
+			let s = '';
+			const chunk = 32768;
+			for (let i = 0; i < u8.length; i += chunk) {
+				s += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+			}
+			return { ok: true, contentType: blob.type, size: blob.size, base64: btoa(s) };
+		} catch (e) { return { ok: false, err: String(e).slice(0, 300) }; }
 	})()`
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		var poll struct {
-			State string `json:"state"`
-			W     int    `json:"w"`
-			H     int    `json:"h"`
+			URL string `json:"url"`
+			At  int64  `json:"at"`
 		}
 		if err := c.EvaluateValue(pollCode, &poll); err != nil {
-			return "", 0, 0, fmt.Errorf("poll image: %w", err)
+			return nil, fmt.Errorf("poll final url: %w", err)
 		}
-		if poll.State == "ready" {
-			var ext struct {
-				OK      bool   `json:"ok"`
-				Err     string `json:"err"`
-				W       int    `json:"w"`
-				H       int    `json:"h"`
-				DataURL string `json:"dataURL"`
+		if poll.URL != "" {
+			var r struct {
+				OK          bool   `json:"ok"`
+				Err         string `json:"err"`
+				Status      int    `json:"status"`
+				ContentType string `json:"contentType"`
+				Size        int    `json:"size"`
+				Base64      string `json:"base64"`
 			}
-			if err := c.EvaluateValue(extractCode, &ext); err != nil {
-				return "", 0, 0, fmt.Errorf("extract image: %w", err)
+			if err := c.EvaluateValue(fetchCode, &r); err != nil {
+				return nil, fmt.Errorf("fetch intercepted url: %w", err)
 			}
-			if !ext.OK {
-				return "", 0, 0, fmt.Errorf("extract image failed: %s", ext.Err)
+			if !r.OK {
+				return nil, fmt.Errorf("fetch intercepted url failed: %s (status=%d)", r.Err, r.Status)
 			}
-			return ext.DataURL, ext.W, ext.H, nil
+			if !strings.HasPrefix(r.ContentType, "image/") {
+				return nil, fmt.Errorf("unexpected content-type: %s (size=%d)", r.ContentType, r.Size)
+			}
+			pngBytes, err := base64.StdEncoding.DecodeString(r.Base64)
+			if err != nil {
+				return nil, fmt.Errorf("base64 decode: %w", err)
+			}
+			return pngBytes, nil
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(300 * time.Millisecond)
 	}
-	return "", 0, 0, fmt.Errorf("timeout waiting for generated image (did Gemini route this prompt to image generation?)")
+	return nil, fmt.Errorf("timeout waiting for download-chain URL (did Gemini change its download flow?)")
+}
+
+// pngDimensions reads width/height from a PNG IHDR chunk without fully
+// decoding pixel data — cheap even for multi-MB images.
+func pngDimensions(b []byte) (int, int, error) {
+	cfg, err := png.DecodeConfig(bytes.NewReader(b))
+	if err != nil {
+		return 0, 0, err
+	}
+	return cfg.Width, cfg.Height, nil
 }
 
 // --- local image handling ---
-
-func decodeDataURL(dataURL string) ([]byte, error) {
-	const prefix = "data:image/png;base64,"
-	if !strings.HasPrefix(dataURL, prefix) {
-		return nil, fmt.Errorf("unexpected dataURL prefix")
-	}
-	return base64.StdEncoding.DecodeString(dataURL[len(prefix):])
-}
 
 func writeThumbnail(pngBytes []byte, path string, width int) error {
 	src, err := png.Decode(bytes.NewReader(pngBytes))
@@ -261,7 +364,7 @@ func writeThumbnail(pngBytes []byte, path string, width int) error {
 	if sb.Dx() == 0 {
 		return fmt.Errorf("source image has zero width")
 	}
-	// Preserve aspect; round height (clamp to ≥1 to survive extreme aspect ratios).
+	// Preserve aspect; clamp height to ≥1 for extreme aspect ratios.
 	height := max(width*sb.Dy()/sb.Dx(), 1)
 	dst := image.NewRGBA(image.Rect(0, 0, width, height))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), src, sb, draw.Over, nil)

@@ -7,27 +7,27 @@ The CLI drives your **real Chrome session** through [`kimi-webbridge`](https://w
 ## What it does
 
 ```bash
-nanobanana-cli gen "画一只可爱的柴犬，卡通风格，白色背景" -o ./out
+nanobanana-cli gen "画一朵粉色月季花，微距特写" -o ./out
 ```
 
 ```json
 {
   "ok": true,
   "data": {
-    "prompt": "画一只可爱的柴犬，卡通风格，白色背景",
-    "full":  "/abs/path/out/20260422-135030-full.png",
-    "thumb": "/abs/path/out/20260422-135030-thumb.png",
-    "width":  1024,
-    "height": 559,
+    "prompt": "画一朵粉色月季花，微距特写",
+    "full":  "/abs/path/out/20260422-143045-full.png",
+    "thumb": "/abs/path/out/20260422-143045-thumb.png",
+    "width":  2816,
+    "height": 1536,
     "thumb_width": 256,
-    "elapsed_ms": 86482
+    "elapsed_ms": 184230
   }
 }
 ```
 
 Each run saves two files into `-o <dir>`:
 
-- `<timestamp>-full.png` — 1024×559 PNG, pixel-exact copy of the image Gemini rendered
+- `<timestamp>-full.png` — the **real** high-resolution original (currently 2816×1536 for Nano Banana; ~5–7 MB), intercepted from Gemini's "Download full-size" response chain
 - `<timestamp>-thumb.png` — PNG scaled to `--thumb-width` px (aspect preserved, default 256)
 
 ## Requirements
@@ -54,7 +54,7 @@ nanobanana-cli gen <prompt> [flags]
 Flags:
   -o, --out string        output directory (default ".")
       --thumb-width int   thumbnail width in px (default 256)
-      --timeout int       max seconds to wait for image generation (default 90)
+      --timeout int       max seconds to wait for image generation (default 300)
 ```
 
 Output is **always JSON** on stdout. Non-zero exit code on error. Error shape:
@@ -75,17 +75,29 @@ POST :10086/command  ─────▶  Chrome extension  ─────▶  g
     navigate                                           (your real session)
     evaluate(inject prompt via execCommand)
     evaluate(click button.send-button)
-    evaluate(poll until .generated-image img.loaded)
-    evaluate(canvas.drawImage → toDataURL('image/png'))
+    evaluate(poll .generated-image img.loaded)
+    evaluate(install step-3 fetch hook)
+    evaluate(click [data-test-id="download-generated-image-button"])
+    evaluate(poll window.__nbFinalURL)
+    evaluate(fetch final URL → base64 encode)
     │                                                         │
-    │ ◀────── base64 PNG (~200KB)  ◀───────────────────────────┘
+    │ ◀─── base64 PNG (2816×1536, ~5–7 MB)  ◀──────────────────┘
     ▼
 Go: decode PNG → write *-full.png → resize (Catmull-Rom) → write *-thumb.png
 ```
 
-**Why canvas extraction instead of clicking "Download full-size"?** Gemini's download mechanism hands the browser a **single-use signed URL** (`lh3.googleusercontent.com/gg-dl/...`) via a `c8o8Fe` batchexecute RPC. The nonce is consumed by Chrome's download pipeline and returns HTTP 400 on any replay. Canvas extraction reads the already-rendered pixels out of the `<img>` directly — same bytes, no nonce race, no dependency on Chrome's download-prompt UX.
+**The `<img>` in the chat is NOT the original.** Gemini renders a 1024×559 display-sized copy inline — fine for viewing, useless for saving. The real original only becomes accessible when you click "Download full-size", which kicks off a 4-hop URL chain:
 
-**Why generate the thumbnail locally instead of asking Gemini?** Gemini produces a single 1024×559 image; the chat UI just CSS-scales it for display. The "thumbnail" you see in the page is not a separate resource. Scaling locally (via `golang.org/x/image/draw.CatmullRom`) is deterministic, offline-capable, and the thumbnail width is user-controlled.
+```
+POST c8o8Fe                                 → JSON; body has a signed gg-dl URL
+GET  lh3.../gg-dl/...?alr=yes               → text/plain; body = fife URL
+GET  work.fife.usercontent.google.com/...   → text/plain; body = final lh3 URL  ← step 3
+GET  lh3.../rd-gg-dl/...                    → image/png  (Chrome downloads)     ← step 4
+```
+
+Letting step 4 complete normally pops up Chrome's "Save As" dialog — nasty for a CLI. Instead, the CLI installs a `window.fetch` hook before clicking download: when step 3 fires, the hook captures the final URL out of the response body into a window variable, then returns an empty `Response` so Gemini's own code has no URL to navigate to. Chrome never sees a Content-Disposition load, no dialog. The CLI then runs its own `fetch(window.__nbFinalURL)` from evaluate — `fetch()` is JS-initiated, stays in the renderer, no download manager. We base64-encode the bytes and ship them back to Go.
+
+**Why generate the thumbnail locally instead of asking Gemini?** There is no separate thumbnail resource — the chat UI just CSS-scales the 1024×559 display copy. Scaling from the original via `golang.org/x/image/draw.CatmullRom` is deterministic, offline, and `--thumb-width` lets the caller pick any size.
 
 ## Project layout
 

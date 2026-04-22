@@ -81,7 +81,7 @@ func newGenCmd() *cobra.Command {
 	}
 	c.Flags().StringVarP(&outDir, "out", "o", ".", "output directory for *-full.png and *-thumb.png")
 	c.Flags().IntVar(&thumbWidth, "thumb-width", 256, "thumbnail width in px (height preserves aspect ratio)")
-	c.Flags().IntVar(&timeoutSec, "timeout", 90, "max seconds to wait for image generation")
+	c.Flags().IntVar(&timeoutSec, "timeout", 300, "max seconds to wait for image generation (Nano Banana 2 + 'thinking' mode can exceed 2 minutes)")
 	// Silence cobra's own error prints; we already emit structured JSON on stderr paths.
 	c.SilenceUsage = true
 	c.SilenceErrors = true
