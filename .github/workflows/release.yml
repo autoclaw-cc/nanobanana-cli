@@ -1,0 +1,139 @@
+name: release
+
+on:
+  # Rolling pre-release: every merge into main rebuilds and updates the
+  # `latest` release so you can always curl the newest binary.
+  push:
+    branches: [main]
+    tags: ['v*']       # Real versioned release on `v*` tag push.
+  workflow_dispatch:   # Manual trigger from the Actions tab.
+
+permissions:
+  contents: write      # Required to create/update GitHub Releases and tags.
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+          - goos: darwin
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: amd64
+            ext: ''
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          EXT: ${{ matrix.ext }}
+        run: |
+          out="nanobanana-cli-${GOOS}-${GOARCH}${EXT}"
+          go build -trimpath -ldflags="-s -w" -o "$out" .
+          ls -la "$out"
+          file "$out" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanobanana-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: nanobanana-cli-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: list artifacts
+        run: ls -la dist/
+
+      - name: decide tag / release kind
+        id: rel
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PRERELEASE=false
+            NAME="$TAG"
+            INTRO="Versioned release from tag \`$TAG\`."
+          else
+            TAG="latest"
+            PRERELEASE=true
+            NAME="latest — main @ ${GITHUB_SHA::7}"
+            INTRO="Rolling pre-release, rebuilt on every merge into \`main\`. Commit: \`${GITHUB_SHA::7}\`."
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          {
+            echo 'intro<<EOF'
+            echo "$INTRO"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Rolling 'latest' needs the old release+tag gone first so the new one
+      # can be created fresh on this commit. Ignore failure on the very first
+      # run when 'latest' doesn't exist yet.
+      - name: clear previous 'latest' (rolling only)
+        if: steps.rel.outputs.tag == 'latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag --repo "${{ github.repository }}" || true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: ${{ steps.rel.outputs.name }}
+          prerelease: ${{ steps.rel.outputs.prerelease }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: ${{ steps.rel.outputs.prerelease == 'false' }}
+          body: |
+            ${{ steps.rel.outputs.intro }}
+
+            ## Binaries
+
+            | Target | Asset |
+            |---|---|
+            | macOS arm64 (Apple Silicon) | `nanobanana-cli-darwin-arm64` |
+            | macOS amd64 (Intel) | `nanobanana-cli-darwin-amd64` |
+            | Linux amd64 | `nanobanana-cli-linux-amd64` |
+            | Windows amd64 | `nanobanana-cli-windows-amd64.exe` |
+
+            Install (macOS arm64 example):
+
+            ```bash
+            curl -L -o nanobanana-cli \
+              https://github.com/${{ github.repository }}/releases/download/${{ steps.rel.outputs.tag }}/nanobanana-cli-darwin-arm64
+            chmod +x nanobanana-cli
+            ./nanobanana-cli --help
+            ```
+
+            See [README](https://github.com/${{ github.repository }}#readme) for prerequisites (Kimi Desktop App + Chrome WebBridge extension + logged-in Gemini).
