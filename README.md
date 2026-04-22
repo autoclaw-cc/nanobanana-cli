@@ -50,7 +50,7 @@ chmod +x nanobanana-cli
 ./nanobanana-cli --help
 ```
 
-Available assets per release: `nanobanana-cli-{darwin,linux}-{arm64,amd64}`. See the [releases page](https://github.com/autoclaw-cc/nanobanana-cli/releases).
+Available assets per release: `nanobanana-cli-darwin-{arm64,amd64}`, `nanobanana-cli-linux-amd64`, `nanobanana-cli-windows-amd64.exe`. See the [releases page](https://github.com/autoclaw-cc/nanobanana-cli/releases).
 
 ### Build from source
 
