@@ -39,6 +39,7 @@ func newGenCmd() *cobra.Command {
 		outDir     string
 		thumbWidth int
 		timeoutSec int
+		refs       []string
 	)
 	c := &cobra.Command{
 		Use:   "gen <prompt>",
@@ -71,6 +72,7 @@ func newGenCmd() *cobra.Command {
 				OutDir:     outDir,
 				ThumbWidth: thumbWidth,
 				Timeout:    time.Duration(timeoutSec) * time.Second,
+				Refs:       refs,
 			})
 			if err != nil {
 				output.Error("gen_failed", err.Error())
@@ -80,6 +82,7 @@ func newGenCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVarP(&outDir, "out", "o", ".", "output directory for *-full.png and *-thumb.png")
+	c.Flags().StringArrayVarP(&refs, "ref", "r", nil, "reference image path to paste into Gemini before sending the prompt (repeatable)")
 	c.Flags().IntVar(&thumbWidth, "thumb-width", 256, "thumbnail width in px (height preserves aspect ratio)")
 	c.Flags().IntVar(&timeoutSec, "timeout", 300, "max seconds to wait for image generation (Nano Banana 2 + 'thinking' mode can exceed 2 minutes)")
 	// Silence cobra's own error prints; we already emit structured JSON on stderr paths.
